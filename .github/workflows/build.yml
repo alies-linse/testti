@@ -1,0 +1,152 @@
+name: Build AwemePlus
+
+# 什么时候自动编译：
+#   - push 到 main / master
+#   - 打一个 v 开头的 tag（例如 v0.1.0）：编译完自动建 Release 并把 deb 挂上去
+#   - 提 PR 时
+#   - 也可以在 Actions 页面手动点 “Run workflow”
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write        # 打 tag 时创建 Release 需要
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      # 想换 SDK 只改这一行（Makefile 里 TARGET 用的是 latest，会自动取这套）
+      SDK_NAME: iPhoneOS16.5.sdk
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 注意：workflow 本身必须待在仓库根目录的 .github/workflows/ 下，
+      # GitHub 不会去子目录里找。这一步解决的是另一件事：
+      # 工程文件（Makefile、Sources/…）可能被放在某个子目录里。
+      - name: 定位工程目录
+        id: locate
+        run: |
+          if [ -f Makefile ] && [ -f Tweak.m ]; then
+            dir="."
+          else
+            mk="$(find . -maxdepth 3 -name Makefile -not -path './theos/*' | head -n1)"
+            if [ -z "$mk" ]; then
+              echo "::error::在仓库里找不到 Makefile / Tweak.m，请确认上传的文件结构"
+              exit 1
+            fi
+            dir="$(dirname "$mk")"
+          fi
+          echo "工程目录：$dir"
+          ls -la "$dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: 安装打包依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fakeroot dpkg-dev rsync xz-utils curl ca-certificates make git
+
+      - name: 缓存 Theos
+        id: theos-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.THEOS }}
+          # 故意不绑定本文件的内容哈希：改个注释不该导致重新下载几 GB 的 SDK
+          key: theos-${{ runner.os }}-${{ env.SDK_NAME }}
+          restore-keys: theos-${{ runner.os }}-
+
+      - name: 下载 Theos
+        if: steps.theos-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+
+          # 只取需要的 SDK（theos/sdks 整仓有好几个 GB，全量拉太慢）
+          git clone --filter=blob:none --no-checkout https://github.com/theos/sdks "$THEOS/sdks"
+          git -C "$THEOS/sdks" sparse-checkout init --cone
+          git -C "$THEOS/sdks" sparse-checkout set "$SDK_NAME"
+          git -C "$THEOS/sdks" checkout
+
+          # sparse 用法万一不灵就退回全量
+          if [ ! -d "$THEOS/sdks/$SDK_NAME" ]; then
+            echo "::warning::sparse checkout 没拿到 $SDK_NAME，改为全量克隆 theos/sdks"
+            rm -rf "$THEOS/sdks"
+            git clone --depth 1 https://github.com/theos/sdks "$THEOS/sdks"
+          fi
+
+          echo "可用 SDK："; ls -1 "$THEOS/sdks"
+
+      - name: 安装 ldid（签名用）
+        run: |
+          set +e
+          curl -fL -o /tmp/ldid \
+            https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
+          chmod +x /tmp/ldid 2>/dev/null
+
+          if ldd /tmp/ldid 2>&1 | grep -q "not found"; then
+            # Procursus 的预编译 ldid 依赖的库在新版 Ubuntu 上可能已经换版本了
+            echo "::warning::Procursus ldid 缺库：$(ldd /tmp/ldid | grep 'not found' | tr -d '\n')，改用 apt 版本"
+            sudo apt-get install -y --no-install-recommends ldid || true
+          else
+            sudo install -m 0755 /tmp/ldid /usr/local/bin/ldid
+          fi
+
+          if command -v ldid >/dev/null 2>&1; then
+            echo "ldid 就绪：$(command -v ldid)"
+          else
+            echo "::warning::没有可用的 ldid，deb 仍会生成，但 dylib 不会被重新签名"
+          fi
+
+      - name: 源码自检（只提示，不阻塞）
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          python3 tools/check_sources.py \
+            || echo "::warning::源码自检有提示，请看上面输出（最终判定交给编译器）"
+
+      - name: 编译打包
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -o pipefail
+          # Theos 默认 -Werror，任何 warning 都会让构建失败。
+          # 先严格编一次；失败就降级重试，保证你能拿到 deb，同时在日志里标出警告。
+          if make package FINALPACKAGE=1; then
+            echo "OK：严格编译通过"
+          else
+            echo "::warning::严格编译失败（多半是某个 warning 被 -Werror 拦下），改用 GO_EASY_ON_ME=1 重试"
+            make clean || true
+            make package FINALPACKAGE=1 GO_EASY_ON_ME=1
+          fi
+
+      - name: 检查产物
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          ls -lh packages/
+          test -n "$(ls -1 packages/*.deb 2>/dev/null)" || { echo "::error::没有生成 deb"; exit 1; }
+
+      - name: 上传 deb（在本次 Actions 运行页面底部下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: AwemePlus-deb
+          path: ${{ steps.locate.outputs.dir }}/packages/*.deb
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 打 tag 时创建 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" packages/*.deb \
+            --title "${GITHUB_REF_NAME}" --generate-notes
