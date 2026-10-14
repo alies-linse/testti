@@ -1,0 +1,8 @@
+Package: com.local.awemeplus
+Name: AwemePlus
+Version: 0.1.0
+Description: 抖音增强（纯净版）：无水印下载视频/图集、长按面板下载按钮、本地设置界面。无服务器、无授权校验、无设备指纹、无遥测。
+Maintainer: local
+Author: local
+Section: Tweaks
+Depends: firmware (>= 15.0)
